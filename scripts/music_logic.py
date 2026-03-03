@@ -72,7 +72,15 @@ def harvest_recordings():
     with _pg_conn() as conn:
         cur = conn.cursor()
 
-        # Truncate to prevent duplicates on re-runs
+        # Create table if it doesn't exist, then truncate to prevent duplicates on re-runs
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS recording_data (
+                instrument_name TEXT,
+                recording_name  TEXT,
+                release_year    INT,
+                country_code    TEXT
+            );
+        """)
         cur.execute("TRUNCATE recording_data;")
         conn.commit()
 
@@ -123,7 +131,7 @@ def move_to_clickhouse():
         ch_client = clickhouse_connect.get_client(
             host='clickhouse', 
             port=8123, 
-            username='default'
+            username='airflow_user'
         )
 
         cur.execute("""
