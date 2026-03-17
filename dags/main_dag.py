@@ -1,3 +1,6 @@
+import sys
+sys.path.append('/opt/airflow')
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
@@ -16,6 +19,11 @@ default_args = {
     'start_date': datetime(2026, 2, 23),
 }
 
+def save_instruments_from_xcom(**context):
+    """Retrieves instrument_map from previous task via XCom."""
+    instrument_map = context['ti'].xcom_pull(task_ids='scout_instruments')
+    save_instruments(instrument_map)
+
 with DAG(
     'musicbrainz_global_pipeline',
     default_args=default_args,
@@ -30,8 +38,7 @@ with DAG(
 
     t2 = PythonOperator(
         task_id='save_instruments',
-        python_callable=save_instruments,
-        op_args=[t1.output]
+        python_callable=save_instruments_from_xcom
     )
 
     t3 = PythonOperator(

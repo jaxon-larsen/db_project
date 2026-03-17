@@ -27,9 +27,12 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server
     container_name: clickhouse_warehouse
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=jaxonator
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "8123:8123" # HTTP (for Python)
+      - "9000:9000" # ClickHouse native protocol
     volumes:
       - ./clickhouse_data:/var/lib/clickhouse
       - ./sql/init_clickhouse.sql:/docker-entrypoint-initdb.d/init_clickhouse.sql
