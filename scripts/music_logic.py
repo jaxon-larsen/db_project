@@ -8,6 +8,9 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
+# Suppress verbose MusicBrainz logging to reduce memory usage
+logging.getLogger('musicbrainzngs').setLevel(logging.WARNING)
+
 musicbrainzngs.set_useragent(
     "MBProject", 
     "0.1", 
@@ -34,8 +37,8 @@ def _pg_conn():
 
 def scout_instruments():
     """Discovers popular instruments from MusicBrainz by usage/recording count."""
-    # Configurable via environment, default to 50 popular instruments
-    target_count = int(os.environ.get("INSTRUMENT_COUNT", "50"))
+    # Configurable via environment, default to 30 popular instruments
+    target_count = int(os.environ.get("INSTRUMENT_COUNT", "30"))
     page_size = 100
     offset = 0
     instrument_map = {}
@@ -124,7 +127,7 @@ def save_instruments(instrument_map):
         for name, uuid in instrument_map.items():
             cur.execute(
                 """
-                INSERT INTO target_instruments (instrument_name, mb_uuid)
+                INSERT INTO instruments (instrument_name, mb_uuid)
                 VALUES (%s, %s)
                 ON CONFLICT (instrument_name) DO NOTHING;
                 """, (name, uuid)
@@ -135,14 +138,16 @@ def save_instruments(instrument_map):
 
 def harvest_recordings():
     """Fetches recordings using 'Earliest Release' logic with pagination and checkpointing."""
-    MAX_RECORDINGS_PER_INSTRUMENT = 10000
+    MAX_RECORDINGS_PER_INSTRUMENT = 2000  # Limit per instrument
     PAGE_SIZE = 100
+    MIN_YEAR = 1900
+    MAX_YEAR = 2026
     
     # Initialize tables
     with _pg_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS recording_data (
+            CREATE TABLE IF NOT EXISTS recordings (
                 recording_id    TEXT NOT NULL,
                 instrument_name TEXT NOT NULL,
                 recording_name  TEXT,
@@ -161,12 +166,12 @@ def harvest_recordings():
             );
         """)
         conn.commit()
-        cur.execute("SELECT instrument_name, mb_uuid FROM target_instruments;")
+        cur.execute("SELECT instrument_name, mb_uuid FROM instruments;")
         scouted = cur.fetchall()
         cur.close()
         
     if not scouted:
-        logger.warning("No instruments found in target_instruments table. Skipping harvest.")
+        logger.warning("No instruments found in instruments table. Skipping harvest.")
         return
 
     logger.info(f"Found {len(scouted)} instruments to harvest (max {MAX_RECORDINGS_PER_INSTRUMENT} per instrument).")
@@ -194,6 +199,9 @@ def harvest_recordings():
             logger.info(f"Harvesting {inst_name} starting at offset {start_offset}...")
             
             offset = start_offset
+            consecutive_errors = 0
+            MAX_CONSECUTIVE_ERRORS = 3
+            
             while offset < MAX_RECORDINGS_PER_INSTRUMENT:
                 query = f"iid:{inst_uuid}"
                 
@@ -204,13 +212,17 @@ def harvest_recordings():
                         offset=offset
                     )
                     
+                    # Reset error counter on success
+                    consecutive_errors = 0
+                    
                     recording_list = result.get('recording-list', [])
                     if not recording_list:
                         logger.info(f"No more recordings found for {inst_name} at offset {offset}")
                         break
                     
-                    # Batch insert recordings
+                    # Batch insert recordings (with early filtering)
                     batch_data = []
+                    skipped_count = 0
                     for rec in recording_list:
                         rec_id = rec.get('id')
                         rec_title = rec.get('title', 'Unknown')
@@ -222,7 +234,9 @@ def harvest_recordings():
                             date_str = release.get('date', '')
                             if date_str and len(date_str) >= 4:
                                 try:
-                                    years.append(int(date_str[:4]))
+                                    year = int(date_str[:4])
+                                    if MIN_YEAR <= year <= MAX_YEAR:
+                                        years.append(year)
                                 except ValueError:
                                     pass
                             
@@ -235,20 +249,25 @@ def harvest_recordings():
                         # Use first country found, or None
                         country_code = countries[0] if countries else None
                         
+                        # Early filtering: skip if missing year or country
+                        if earliest_year is None or country_code is None:
+                            skipped_count += 1
+                            continue
+                        
                         batch_data.append((rec_id, inst_name, rec_title, earliest_year, country_code))
                     
                     # Bulk insert with ON CONFLICT to handle duplicates
                     if batch_data:
                         cur.executemany(
                             """
-                            INSERT INTO recording_data (recording_id, instrument_name, recording_name, release_year, country_code)
+                            INSERT INTO recordings (recording_id, instrument_name, recording_name, release_year, country_code)
                             VALUES (%s, %s, %s, %s, %s)
                             ON CONFLICT (recording_id, instrument_name) DO NOTHING
                             """, batch_data
                         )
                         conn.commit()
                     
-                    fetched_count = len(recording_list)
+                    fetched_count = len(batch_data)  # Only count kept recordings
                     total_fetched += fetched_count
                     offset += PAGE_SIZE
                     
@@ -265,20 +284,29 @@ def harvest_recordings():
                     """, (inst_name, total_fetched, offset, False))
                     conn.commit()
                     
-                    logger.info(f"{inst_name}: fetched {fetched_count} recordings (total: {total_fetched}, offset: {offset})")
+                    logger.info(f"{inst_name}: kept {fetched_count}, skipped {skipped_count} (total: {total_fetched}, offset: {offset})")
                     
-                    # Stop if we got less than PAGE_SIZE (no more results)
-                    if fetched_count < PAGE_SIZE:
+                    # Stop if we got less than PAGE_SIZE from API (no more results)
+                    if len(recording_list) < PAGE_SIZE:
                         logger.info(f"Reached end of results for {inst_name}")
                         break
                 
                 except Exception as e:
-                    logger.error(f"Error harvesting {inst_name} at offset {offset}: {e}")
-                    # Don't raise - continue to next instrument
-                    break
+                    consecutive_errors += 1
+                    logger.error(f"Error harvesting {inst_name} at offset {offset}: {e} (attempt {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS})")
+                    
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        logger.error(f"Too many consecutive errors for {inst_name}, moving to next instrument")
+                        break
+                    
+                    # Wait longer before retry on network errors
+                    time.sleep(3)
+                    continue  # Retry same offset
                 
                 finally:
-                    time.sleep(1)  # Rate limiting
+                    # Only sleep if we didn't just error and sleep already
+                    if consecutive_errors == 0:
+                        time.sleep(1)  # Rate limiting
             
             # Mark as completed
             cur.execute("""
@@ -306,17 +334,17 @@ def move_to_clickhouse():
         
         # Truncate ClickHouse table for clean state
         logger.info("Truncating ClickHouse table for fresh load...")
-        ch_client.command('TRUNCATE TABLE global_instrument_trends')
+        ch_client.command('TRUNCATE TABLE instrument_trends')
         
         with _pg_conn() as conn:
             cur = conn.cursor()
             
-            # Get total count for logging
-            cur.execute("SELECT COUNT(DISTINCT recording_id) FROM recording_data WHERE release_year IS NOT NULL;")
+            # Get total count for logging (no null filter needed - early filtering handles this)
+            cur.execute("SELECT COUNT(DISTINCT recording_id) FROM recordings;")
             total_rows = cur.fetchone()[0]
             
             if total_rows == 0:
-                logger.warning("No data with valid release_year to move to ClickHouse.")
+                logger.warning("No data to move to ClickHouse.")
                 cur.close()
                 return
             
@@ -326,8 +354,7 @@ def move_to_clickhouse():
             cur.execute("""
                 SELECT DISTINCT ON (recording_id) 
                     instrument_name, recording_name, release_year, country_code 
-                FROM recording_data 
-                WHERE release_year IS NOT NULL
+                FROM recordings 
                 ORDER BY recording_id, instrument_name;
             """)
             
@@ -339,7 +366,7 @@ def move_to_clickhouse():
                 if not batch:
                     break
                 
-                ch_client.insert('global_instrument_trends', batch, 
+                ch_client.insert('instrument_trends', batch, 
                                column_names=['instrument', 'recording_name', 'release_year', 'country_code'])
                 rows_inserted += len(batch)
                 logger.info(f"Inserted batch: {rows_inserted}/{total_rows} rows")

@@ -43,7 +43,8 @@ with DAG(
 
     t3 = PythonOperator(
         task_id='harvest_recordings',
-        python_callable=harvest_recordings
+        python_callable=harvest_recordings,
+        execution_timeout=timedelta(hours=3)
     )
 
     t4 = PythonOperator(

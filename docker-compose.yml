@@ -52,6 +52,9 @@ services:
     container_name: airflow_orchestrator
     command: standalone
     env_file: .env
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_source/airflow_meta
@@ -62,14 +65,15 @@ services:
       - AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY=4
       - AIRFLOW__WEBSERVER__WORKERS=2
       - AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL=1800
-      - INSTRUMENT_COUNT=${INSTRUMENT_COUNT:-50}
+      - AIRFLOW__LOGGING__LOGGING_LEVEL=WARNING
+      - INSTRUMENT_COUNT=${INSTRUMENT_COUNT:-30}
       - POSTGRES_HOST=${POSTGRES_HOST}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
     ports:
-      - "8080:8080"
+      - "8080:8080" # Run Airflow on port 8080
     volumes:
       - ./dags:/opt/airflow/dags
       - ./scripts:/opt/airflow/dags/scripts
@@ -79,6 +83,6 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2gb
+          memory: 3gb
         reservations:
-          memory: 1gb
+          memory: 1.5gb

@@ -8,12 +8,12 @@ EOSQL
 
 # Create application tables in the musicbrainz database
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-    CREATE TABLE IF NOT EXISTS target_instruments (
+    CREATE TABLE IF NOT EXISTS instruments (
         instrument_name TEXT PRIMARY KEY,
         mb_uuid TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS recording_data (
+    CREATE TABLE IF NOT EXISTS recordings (
         recording_id    TEXT NOT NULL,
         instrument_name TEXT NOT NULL,
         recording_name  TEXT,
@@ -22,8 +22,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
         PRIMARY KEY (recording_id, instrument_name)
     );
     
-    CREATE INDEX IF NOT EXISTS idx_recording_instrument ON recording_data(instrument_name);
-    CREATE INDEX IF NOT EXISTS idx_recording_year ON recording_data(release_year);
+    CREATE INDEX IF NOT EXISTS idx_recordings_instrument ON recordings(instrument_name);
+    CREATE INDEX IF NOT EXISTS idx_recordings_year ON recordings(release_year);
+    CREATE INDEX IF NOT EXISTS idx_recordings_country ON recordings(country_code);
 
     CREATE TABLE IF NOT EXISTS harvest_progress (
         instrument_name TEXT PRIMARY KEY,
