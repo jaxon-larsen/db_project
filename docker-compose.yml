@@ -1,29 +1,37 @@
 services:
+  # PostgreSQL staging database for instrument targets and harvested recordings.
   postgres_source:
     image: postgres:15
     container_name: postgres_source
+    # Loads shared credentials and db name from .env.
     env_file: .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
+      # Expose Postgres for local tooling/debugging.
       - "5432:5432"
     volumes:
+      # Persist database data across container restarts.
       - ./postgres_data:/var/lib/postgresql/data
+      # One-time bootstrap script that creates staging tables.
       - ./sql/init_postgres.sh:/docker-entrypoint-initdb.d/init_postgres.sh
+    # Wait until Postgres accepts connections before dependent services start.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    # Keep resource usage predictable on shared hosts.
     deploy:
       resources:
         limits:
           memory: 1gb
         reservations:
           memory: 512mb
-
+ 
+  # ClickHouse warehouse for analytical/global instrument trend queries.
   clickhouse:
     image: clickhouse/clickhouse-server
     container_name: clickhouse_warehouse
@@ -34,30 +42,39 @@ services:
       - "8123:8123" # HTTP (for Python)
       - "9000:9000" # ClickHouse native protocol
     volumes:
+      # Persist ClickHouse parts and metadata.
       - ./clickhouse_data:/var/lib/clickhouse
+      # One-time bootstrap script to create warehouse schema.
       - ./sql/init_clickhouse.sql:/docker-entrypoint-initdb.d/init_clickhouse.sql
+    # Recommended file descriptor limits for ClickHouse throughput.
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
+    # Keep resource usage predictable on shared hosts.
     deploy:
       resources:
         limits:
           memory: 1gb
         reservations:
           memory: 512mb
-
+ 
+  # Airflow orchestrator that schedules and runs the ETL DAG.
   airflow:
     build: .
     container_name: airflow_orchestrator
+    # Standalone mode runs webserver + scheduler in one container.
     command: standalone
     env_file: .env
+    # Public DNS fallback for external API resolution from inside container.
     dns:
       - 8.8.8.8
       - 8.8.4.4
     environment:
+      # Executor and metadata database for Airflow internals.
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_source/airflow_meta
+      # Concurrency tuning to avoid overloading local resources/API limits.
       - AIRFLOW__CORE__PARALLELISM=4
       - AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG=1
       - AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=1
@@ -66,6 +83,7 @@ services:
       - AIRFLOW__WEBSERVER__WORKERS=2
       - AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL=1800
       - AIRFLOW__LOGGING__LOGGING_LEVEL=WARNING
+      # Pipeline runtime settings consumed by scripts/music_logic.py.
       - INSTRUMENT_COUNT=${INSTRUMENT_COUNT:-30}
       - POSTGRES_HOST=${POSTGRES_HOST}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -75,11 +93,14 @@ services:
     ports:
       - "8080:8080" # Run Airflow on port 8080
     volumes:
+      # Mount DAG definitions and ETL code into Airflow runtime.
       - ./dags:/opt/airflow/dags
       - ./scripts:/opt/airflow/dags/scripts
+    # Ensure Airflow starts after Postgres is healthy.
     depends_on:
       postgres_source:
         condition: service_healthy
+    # Airflow needs higher memory than DB containers.
     deploy:
       resources:
         limits:

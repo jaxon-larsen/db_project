@@ -26,6 +26,8 @@ _PG_CONN_PARAMS = {
 
 @contextmanager
 def _pg_conn():
+    """Yield a PostgreSQL connection with rollback on errors."""
+    # Centralize DB connection handling for all ETL steps.
     conn = psycopg2.connect(**_PG_CONN_PARAMS)
     try:
         yield conn
@@ -37,7 +39,7 @@ def _pg_conn():
 
 def scout_instruments():
     """Discovers popular instruments from MusicBrainz by usage/recording count."""
-    # Configurable via environment, default to 30 popular instruments
+    # Build a {instrument_name: MusicBrainz UUID} map for downstream tasks.
     target_count = int(os.environ.get("INSTRUMENT_COUNT", "30"))
     page_size = 100
     offset = 0
@@ -61,7 +63,7 @@ def scout_instruments():
                 inst = result['instrument-list'][0]
                 name = inst.get('name', inst_name)
                 uuid = inst.get('id')
-                if uuid and name not in [k for k in instrument_map.keys()]:
+                if uuid and name not in instrument_map:
                     instrument_map[name] = uuid
                     logger.info(f"Priority instrument #{len(instrument_map)}: {name}")
         except Exception as e:
@@ -92,12 +94,6 @@ def scout_instruments():
                 if not name or not uuid or name in instrument_map:
                     continue
                 
-                # Optional: Filter out non-traditional instruments
-                # (uncomment to exclude things like "handclaps", "orchestra")
-                # skip_terms = ['unspecified', 'other', 'unknown']
-                # if any(term in name.lower() for term in skip_terms):
-                #     continue
-                
                 instrument_map[name] = uuid
                 logger.info(f"Discovered #{len(instrument_map)}: {name}")
                 
@@ -118,6 +114,7 @@ def scout_instruments():
 
 def save_instruments(instrument_map):
     """Saves the scouted UUIDs into the reference table."""
+    # Skip writes when there is nothing to persist.
     if not instrument_map:
         logger.warning("No instruments found to save. Instrument map is empty.")
         return
@@ -138,6 +135,7 @@ def save_instruments(instrument_map):
 
 def harvest_recordings():
     """Fetches recordings using 'Earliest Release' logic with pagination and checkpointing."""
+    # Iterate through instruments and persist cleaned recording rows with checkpoints.
     MAX_RECORDINGS_PER_INSTRUMENT = 2000  # Limit per instrument
     PAGE_SIZE = 100
     MIN_YEAR = 1900
@@ -190,7 +188,6 @@ def harvest_recordings():
             
             if progress and progress[2]:  # completed = True
                 logger.info(f"Skipping {inst_name} - already completed with {progress[0]} recordings.")
-                cur.close()
                 continue
             
             start_offset = progress[1] if progress else 0
@@ -323,6 +320,7 @@ def harvest_recordings():
 
 def move_to_clickhouse():
     """Moves harvested data from Postgres to ClickHouse for analysis."""
+    # Rebuild analytics table contents from the latest Postgres staging data.
     ch_client = None
     try:
         ch_client = clickhouse_connect.get_client(
@@ -339,8 +337,8 @@ def move_to_clickhouse():
         with _pg_conn() as conn:
             cur = conn.cursor()
             
-            # Get total count for logging (no null filter needed - early filtering handles this)
-            cur.execute("SELECT COUNT(DISTINCT recording_id) FROM recordings;")
+            # Get total count for logging (all instrument-recording pairs)
+            cur.execute("SELECT COUNT(*) FROM recordings;")
             total_rows = cur.fetchone()[0]
             
             if total_rows == 0:
@@ -348,14 +346,13 @@ def move_to_clickhouse():
                 cur.close()
                 return
             
-            logger.info(f"Moving {total_rows} unique recordings to ClickHouse in batches...")
+            logger.info(f"Moving {total_rows} instrument-recording pairs to ClickHouse in batches...")
             
-            # Use DISTINCT to avoid duplicate recordings in ClickHouse
+            # Move all instrument-recording pairs (not just unique recordings)
             cur.execute("""
-                SELECT DISTINCT ON (recording_id) 
-                    instrument_name, recording_name, release_year, country_code 
+                SELECT instrument_name, recording_name, release_year, country_code 
                 FROM recordings 
-                ORDER BY recording_id, instrument_name;
+                ORDER BY instrument_name, release_year;
             """)
             
             batch_size = 1000
@@ -378,4 +375,3 @@ def move_to_clickhouse():
         if ch_client:
             ch_client.close()
             logger.info("ClickHouse connection closed.")
-

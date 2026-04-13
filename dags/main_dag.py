@@ -1,5 +1,5 @@
 import sys
-sys.path.append('/opt/airflow/dags')
+sys.path.append('/opt/airflow')
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -21,6 +21,7 @@ default_args = {
 
 def save_instruments_from_xcom(**context):
     """Retrieves instrument_map from previous task via XCom."""
+    # Pull scout results and persist them in Postgres.
     instrument_map = context['ti'].xcom_pull(task_ids='scout_instruments')
     save_instruments(instrument_map)
 
