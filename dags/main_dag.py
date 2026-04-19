@@ -3,11 +3,14 @@ sys.path.append('/opt/airflow')
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models.xcom_arg import XComArg
 from datetime import datetime, timedelta
 
 from scripts.music_logic import (scout_instruments, 
                                  save_instruments, 
-                                 harvest_recordings, 
+                                 reset_pipeline_data,
+                                 census_top_country_args,
+                                 harvest_country_recordings,
                                  move_to_clickhouse
 )
 
@@ -43,14 +46,23 @@ with DAG(
     )
 
     t3 = PythonOperator(
-        task_id='harvest_recordings',
-        python_callable=harvest_recordings,
-        execution_timeout=timedelta(hours=3)
+        task_id='reset_data',
+        python_callable=reset_pipeline_data
     )
 
     t4 = PythonOperator(
+        task_id='census_countries',
+        python_callable=census_top_country_args
+    )
+
+    t5 = PythonOperator.partial(
+        task_id='harvest_recordings',
+        python_callable=harvest_country_recordings
+    ).expand(op_args=XComArg(t4))
+
+    t6 = PythonOperator(
         task_id='move_to_clickhouse',
         python_callable=move_to_clickhouse
     )
 
-    t1 >> t2 >> t3 >> t4
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6

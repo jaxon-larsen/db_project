@@ -3,7 +3,10 @@ import logging
 import musicbrainzngs
 import psycopg2
 import time
+import math
+import random
 import clickhouse_connect
+from datetime import datetime
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,23 @@ _PG_CONN_PARAMS = {
     "user":     os.environ.get("POSTGRES_USER"),
     "password": os.environ.get("POSTGRES_PASSWORD"),
 }
+
+PAGE_SIZE = 100
+MIN_YEAR = 1950
+MAX_YEAR = datetime.utcnow().year
+DEFAULT_SAMPLE_RATIO = float(os.environ.get("COUNTRY_SAMPLE_RATIO", "0.10"))
+DEFAULT_MAX_SAMPLE_PER_COUNTRY = int(os.environ.get("MAX_SAMPLE_PER_COUNTRY", "5000"))
+OFFICIAL_ONLY = os.environ.get("OFFICIAL_ONLY", "false").lower() in {"1", "true", "yes"}
+
+# Fixed candidate list for country census ranking.
+CENSUS_COUNTRY_CODES = [
+    "US", "GB", "DE", "FR", "JP", "CA", "AU", "IT", "ES", "BR", "SE", "NL", "NO", "DK", "FI",
+    "IE", "BE", "CH", "AT", "PT", "PL", "CZ", "HU", "RO", "GR", "TR", "RU", "UA", "HR", "RS",
+    "BG", "SI", "SK", "EE", "LV", "LT", "IS", "MX", "AR", "CL", "CO", "PE", "VE", "UY", "PY",
+    "BO", "EC", "CR", "PA", "DO", "CU", "GT", "SV", "HN", "NI", "JM", "TT", "PR", "ZA", "NG",
+    "KE", "GH", "MA", "TN", "EG", "IL", "SA", "AE", "IN", "PK", "BD", "LK", "NP", "TH", "VN",
+    "MY", "SG", "ID", "PH", "KR", "CN", "TW", "HK", "NZ"
+]
 
 @contextmanager
 def _pg_conn():
@@ -121,6 +141,7 @@ def save_instruments(instrument_map):
     
     with _pg_conn() as conn:
         cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE instruments;")
         for name, uuid in instrument_map.items():
             cur.execute(
                 """
@@ -133,190 +154,203 @@ def save_instruments(instrument_map):
         cur.close()
     logger.info(f"Successfully saved {len(instrument_map)} instruments to Postgres.")
 
-def harvest_recordings():
-    """Fetches recordings using 'Earliest Release' logic with pagination and checkpointing."""
-    # Iterate through instruments and persist cleaned recording rows with checkpoints.
-    MAX_RECORDINGS_PER_INSTRUMENT = 2000  # Limit per instrument
-    PAGE_SIZE = 100
-    MIN_YEAR = 1900
-    MAX_YEAR = 2026
-    
-    # Initialize tables
+def _escape_query_value(value):
+    return value.replace('"', '\\"')
+
+def _qualified_country_query(country_code, instrument_name=None, official_only=OFFICIAL_ONLY):
+    query_parts = [
+        f"country:{country_code}",
+        "has_instrument:true",
+    ]
+    if official_only:
+        query_parts.append("status:official")
+    if instrument_name:
+        query_parts.append(f'instrument:"{_escape_query_value(instrument_name)}"')
+    return " AND ".join(query_parts)
+
+def _count_recordings(query):
+    try:
+        result = musicbrainzngs.search_recordings(query=query, limit=1, offset=0)
+        count_value = result.get("recording-count", 0)
+        return int(count_value)
+    except Exception as e:
+        logger.error(f"Count query failed for '{query}': {e}")
+        return 0
+    finally:
+        time.sleep(1)
+
+def _extract_earliest_release(rec, target_country):
+    years = []
+    countries = []
+    for release in rec.get("release-list", []):
+        date_str = release.get("date", "")
+        if date_str and len(date_str) >= 4:
+            try:
+                year = int(date_str[:4])
+                if MIN_YEAR <= year <= MAX_YEAR:
+                    years.append(year)
+            except ValueError:
+                pass
+        country = release.get("country")
+        if country:
+            countries.append(country)
+
+    if not years:
+        return None, None
+
+    # Prefer matching country from release metadata when available.
+    country_code = target_country if target_country in countries else (countries[0] if countries else target_country)
+    return min(years), country_code
+
+def reset_pipeline_data():
+    """Clears staging and warehouse tables before a fresh randomized sample run."""
     with _pg_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS recordings (
-                recording_id    TEXT NOT NULL,
-                instrument_name TEXT NOT NULL,
-                recording_name  TEXT,
-                release_year    INT,
-                country_code    TEXT,
-                PRIMARY KEY (recording_id, instrument_name)
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS harvest_progress (
-                instrument_name TEXT PRIMARY KEY,
-                recordings_fetched INT DEFAULT 0,
-                last_offset INT DEFAULT 0,
-                completed BOOLEAN DEFAULT FALSE,
-                last_updated TIMESTAMP DEFAULT NOW()
-            );
-        """)
+        cur.execute("TRUNCATE TABLE recordings;")
+        cur.execute("TRUNCATE TABLE harvest_progress;")
         conn.commit()
+        cur.close()
+
+    ch_client = clickhouse_connect.get_client(
+        host='clickhouse_warehouse',
+        port=8123,
+        username='default',
+        password=os.environ.get('CLICKHOUSE_PASSWORD', '')
+    )
+    try:
+        ch_client.command('TRUNCATE TABLE instrument_trends')
+    finally:
+        ch_client.close()
+
+    logger.info("Reset complete: Postgres recordings/harvest_progress and ClickHouse instrument_trends truncated.")
+
+def census_top_countries(top_n=10):
+    """Ranks countries by qualified recording volume and returns top country codes."""
+    country_counts = []
+    for code in CENSUS_COUNTRY_CODES:
+        query = _qualified_country_query(code)
+        count = _count_recordings(query)
+        if count > 0:
+            country_counts.append((code, count))
+            logger.info(f"Census count {code}: {count}")
+
+    country_counts.sort(key=lambda row: row[1], reverse=True)
+    top_countries = [code for code, _ in country_counts[:top_n]]
+    logger.info(f"Selected top countries: {top_countries}")
+    return top_countries
+
+def census_top_country_args(top_n=10):
+    """Returns top countries as mapped PythonOperator op_args payload."""
+    return [[code] for code in census_top_countries(top_n=top_n)]
+
+def harvest_country_recordings(country_code):
+    """Harvests random-offset samples for one country and writes staged rows to Postgres."""
+    with _pg_conn() as conn:
+        cur = conn.cursor()
         cur.execute("SELECT instrument_name, mb_uuid FROM instruments;")
         scouted = cur.fetchall()
         cur.close()
-        
+
     if not scouted:
-        logger.warning("No instruments found in instruments table. Skipping harvest.")
+        logger.warning("No instruments found in instruments table. Country harvest skipped.")
+        return 0
+
+    country_total = _count_recordings(_qualified_country_query(country_code))
+    if country_total == 0:
+        logger.warning(f"No qualified recordings for country {country_code}.")
+        return 0
+
+    target_rows = min(int(country_total * DEFAULT_SAMPLE_RATIO), DEFAULT_MAX_SAMPLE_PER_COUNTRY)
+    target_rows = max(target_rows, 1)
+    per_instrument_target = max(1, math.ceil(target_rows / len(scouted)))
+    rng = random.Random(f"{country_code}:{country_total}")
+
+    logger.info(
+        f"{country_code}: total qualified={country_total}, target_rows={target_rows}, "
+        f"instruments={len(scouted)}, per_instrument_target={per_instrument_target}"
+    )
+
+    country_kept = 0
+    with _pg_conn() as conn:
+        cur = conn.cursor()
+        for inst_name, _ in scouted:
+            if country_kept >= target_rows:
+                break
+
+            query = _qualified_country_query(country_code, instrument_name=inst_name)
+            inst_count = _count_recordings(query)
+            if inst_count == 0:
+                continue
+
+            total_pages = math.ceil(inst_count / PAGE_SIZE)
+            page_indexes = list(range(total_pages))
+            rng.shuffle(page_indexes)
+
+            kept_for_instrument = 0
+            for page_index in page_indexes:
+                if kept_for_instrument >= per_instrument_target or country_kept >= target_rows:
+                    break
+
+                offset = page_index * PAGE_SIZE
+                try:
+                    result = musicbrainzngs.search_recordings(query=query, limit=PAGE_SIZE, offset=offset)
+                except Exception as e:
+                    logger.error(f"Harvest query failed for {country_code}/{inst_name} at offset {offset}: {e}")
+                    time.sleep(1)
+                    continue
+                finally:
+                    time.sleep(1)
+
+                recording_list = result.get("recording-list", [])
+                if not recording_list:
+                    continue
+
+                batch_data = []
+                for rec in recording_list:
+                    if kept_for_instrument >= per_instrument_target or country_kept >= target_rows:
+                        break
+
+                    rec_id = rec.get("id")
+                    rec_title = rec.get("title", "Unknown")
+                    if not rec_id:
+                        continue
+
+                    earliest_year, release_country = _extract_earliest_release(rec, country_code)
+                    if earliest_year is None or not release_country:
+                        continue
+
+                    batch_data.append((rec_id, inst_name, rec_title, earliest_year, release_country))
+                    kept_for_instrument += 1
+                    country_kept += 1
+
+                if batch_data:
+                    cur.executemany(
+                        """
+                        INSERT INTO recordings (recording_id, instrument_name, recording_name, release_year, country_code)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (recording_id, instrument_name) DO NOTHING
+                        """,
+                        batch_data
+                    )
+                    conn.commit()
+
+            logger.info(f"{country_code}/{inst_name}: kept {kept_for_instrument}")
+
+        cur.close()
+
+    logger.info(f"{country_code}: completed with {country_kept} staged rows.")
+    return country_kept
+
+def harvest_recordings(country_codes):
+    """Harvests recordings by country list returned from census task."""
+    if not country_codes:
+        logger.warning("No country codes provided for harvest.")
         return
 
-    logger.info(f"Found {len(scouted)} instruments to harvest (max {MAX_RECORDINGS_PER_INSTRUMENT} per instrument).")
-    
-    for inst_name, inst_uuid in scouted:
-        # Use a fresh connection for each instrument to avoid long-lived connections
-        with _pg_conn() as conn:
-            cur = conn.cursor()
-            # Check if already completed
-            cur.execute("""
-                SELECT recordings_fetched, last_offset, completed 
-                FROM harvest_progress 
-                WHERE instrument_name = %s
-            """, (inst_name,))
-            progress = cur.fetchone()
-            
-            if progress and progress[2]:  # completed = True
-                logger.info(f"Skipping {inst_name} - already completed with {progress[0]} recordings.")
-                continue
-            
-            start_offset = progress[1] if progress else 0
-            total_fetched = progress[0] if progress else 0
-            
-            logger.info(f"Harvesting {inst_name} starting at offset {start_offset}...")
-            
-            offset = start_offset
-            consecutive_errors = 0
-            MAX_CONSECUTIVE_ERRORS = 3
-            
-            while offset < MAX_RECORDINGS_PER_INSTRUMENT:
-                query = f"iid:{inst_uuid}"
-                
-                try:
-                    result = musicbrainzngs.search_recordings(
-                        query=query, 
-                        limit=PAGE_SIZE, 
-                        offset=offset
-                    )
-                    
-                    # Reset error counter on success
-                    consecutive_errors = 0
-                    
-                    recording_list = result.get('recording-list', [])
-                    if not recording_list:
-                        logger.info(f"No more recordings found for {inst_name} at offset {offset}")
-                        break
-                    
-                    # Batch insert recordings (with early filtering)
-                    batch_data = []
-                    skipped_count = 0
-                    for rec in recording_list:
-                        rec_id = rec.get('id')
-                        rec_title = rec.get('title', 'Unknown')
-                        
-                        # Find the earliest year across all releases
-                        years = []
-                        countries = []
-                        for release in rec.get('release-list', []):
-                            date_str = release.get('date', '')
-                            if date_str and len(date_str) >= 4:
-                                try:
-                                    year = int(date_str[:4])
-                                    if MIN_YEAR <= year <= MAX_YEAR:
-                                        years.append(year)
-                                except ValueError:
-                                    pass
-                            
-                            # Get country from release
-                            country = release.get('country', None)
-                            if country:
-                                countries.append(country)
-                        
-                        earliest_year = min(years) if years else None
-                        # Use first country found, or None
-                        country_code = countries[0] if countries else None
-                        
-                        # Early filtering: skip if missing year or country
-                        if earliest_year is None or country_code is None:
-                            skipped_count += 1
-                            continue
-                        
-                        batch_data.append((rec_id, inst_name, rec_title, earliest_year, country_code))
-                    
-                    # Bulk insert with ON CONFLICT to handle duplicates
-                    if batch_data:
-                        cur.executemany(
-                            """
-                            INSERT INTO recordings (recording_id, instrument_name, recording_name, release_year, country_code)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (recording_id, instrument_name) DO NOTHING
-                            """, batch_data
-                        )
-                        conn.commit()
-                    
-                    fetched_count = len(batch_data)  # Only count kept recordings
-                    total_fetched += fetched_count
-                    offset += PAGE_SIZE
-                    
-                    # Update progress checkpoint
-                    cur.execute("""
-                        INSERT INTO harvest_progress (instrument_name, recordings_fetched, last_offset, completed, last_updated)
-                        VALUES (%s, %s, %s, %s, NOW())
-                        ON CONFLICT (instrument_name) 
-                        DO UPDATE SET 
-                            recordings_fetched = EXCLUDED.recordings_fetched,
-                            last_offset = EXCLUDED.last_offset,
-                            completed = EXCLUDED.completed,
-                            last_updated = NOW()
-                    """, (inst_name, total_fetched, offset, False))
-                    conn.commit()
-                    
-                    logger.info(f"{inst_name}: kept {fetched_count}, skipped {skipped_count} (total: {total_fetched}, offset: {offset})")
-                    
-                    # Stop if we got less than PAGE_SIZE from API (no more results)
-                    if len(recording_list) < PAGE_SIZE:
-                        logger.info(f"Reached end of results for {inst_name}")
-                        break
-                
-                except Exception as e:
-                    consecutive_errors += 1
-                    logger.error(f"Error harvesting {inst_name} at offset {offset}: {e} (attempt {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS})")
-                    
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        logger.error(f"Too many consecutive errors for {inst_name}, moving to next instrument")
-                        break
-                    
-                    # Wait longer before retry on network errors
-                    time.sleep(3)
-                    continue  # Retry same offset
-                
-                finally:
-                    # Only sleep if we didn't just error and sleep already
-                    if consecutive_errors == 0:
-                        time.sleep(1)  # Rate limiting
-            
-            # Mark as completed
-            cur.execute("""
-                UPDATE harvest_progress 
-                SET completed = TRUE, last_updated = NOW()
-                WHERE instrument_name = %s
-            """, (inst_name,))
-            conn.commit()
-            cur.close()
-            
-            logger.info(f"Completed {inst_name}: {total_fetched} total recordings harvested")
-    
-    logger.info("Harvesting complete!")
+    total_rows = 0
+    for code in country_codes:
+        total_rows += harvest_country_recordings(code)
+    logger.info(f"Country harvest complete. Total staged rows: {total_rows}")
 
 def move_to_clickhouse():
     """Moves harvested data from Postgres to ClickHouse for analysis."""
